@@ -33,6 +33,7 @@ Uploads and downloads are streamed straight to and from disk, so memory stays fl
 │   └── format.js
 ├── public/             # index.html, app.js, style.css (the web UI)
 ├── test/integration.test.js
+├── .github/workflows/image.yml    # CI: test, build, push image to ghcr.io
 ├── k8s/                # kustomization.yaml, pvc.yaml, deployment.yaml, service.yaml, ingress.yaml
 └── traefik/helmchartconfig.yaml   # one-time cluster setting for long uploads (kube-system)
 ```
@@ -48,62 +49,52 @@ DATA_DIR=./data PORT=8080 npm start        # then open http://localhost:8080
 
 ## Deploy: source to live site
 
-Values you must supply are written as **`YOUR_…` placeholders**:
-
-| Placeholder | Example |
+| What | Where |
 |---|---|
-| `YOUR_GIT_REPO_URL` | `https://github.com/your-user/share-app.git` |
-| `YOUR_REGISTRY` | `ghcr.io/your-user` or `docker.io/your-user` |
-| `YOUR_CLUSTER_ISSUER` (optional, for TLS) | `letsencrypt-prod` |
+| Source | https://github.com/chevvyy/share-app (private) |
+| Image | `ghcr.io/chevvyy/share-app`, built by GitHub Actions (`.github/workflows/image.yml`) |
+| Namespace | `claude-sandbox` (change `namespace:` in `k8s/kustomization.yaml` to use another) |
 
-The manifests deploy into the **`claude-sandbox`** namespace. To use a different one, change `namespace:` in `k8s/kustomization.yaml` and the `-n` flags below.
-
-### 1. Push the project to git (dev machine)
+### 1. Push to git
 
 ```bash
-cd share-app
-git init -b main            # skip if already a repo
-git add .
-git commit -m "share-app: initial commit"
-git remote add origin YOUR_GIT_REPO_URL
-git push -u origin main
+git clone https://github.com/chevvyy/share-app.git && cd share-app   # or work in an existing clone
+# ...make changes...
+git commit -am "Describe the change"
+git push                                    # builds and pushes :main and :sha-<short>
 ```
 
-### 2. Pull it and build/push the image (any machine with Docker)
+### 2. Build and push the image (GitHub Actions does it)
+
+Every push runs the tests and then builds a multi-arch image (amd64 and arm64). To release a version that the manifests can pin, push a git tag:
 
 ```bash
-git clone YOUR_GIT_REPO_URL share-app && cd share-app
-docker build -t YOUR_REGISTRY/share-app:1.0.0 .
-docker push YOUR_REGISTRY/share-app:1.0.0
+git tag v1.0.1 && git push origin v1.0.1    # builds ghcr.io/chevvyy/share-app:1.0.1
+sed -i 's/newTag: ".*"/newTag: "1.0.1"/' k8s/kustomization.yaml
+git commit -am "Deploy 1.0.1" && git push
 ```
 
-Record the image in git, so that the repo describes exactly what is deployed:
+Watch the build at https://github.com/chevvyy/share-app/actions.
 
-```bash
-sed -i 's#YOUR_REGISTRY/share-app#ghcr.io/your-user/share-app#' k8s/kustomization.yaml   # your real registry path
-git commit -am "Deploy share-app 1.0.0" && git push
-```
+**Letting the cluster pull the image.** GHCR packages start out private. Choose one:
+
+- **Make the package public** (simplest; it contains only this app's code, no secrets). Go to https://github.com/users/chevvyy/packages/container/share-app/settings → *Change visibility* → *Public*.
+- **Keep it private** and give the cluster a pull secret. Create a *classic* token with only `read:packages` at https://github.com/settings/tokens, then run:
+
+  ```bash
+  kubectl -n claude-sandbox create secret docker-registry ghcr-pull \
+    --docker-server=ghcr.io --docker-username=chevvyy --docker-password=PASTE_CLASSIC_TOKEN
+  kubectl -n claude-sandbox patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+  ```
 
 <details>
-<summary>Private registry: add a pull secret</summary>
+<summary>Building by hand instead (any machine with Docker)</summary>
 
 ```bash
-kubectl -n claude-sandbox create secret docker-registry share-regcred \
-  --docker-server=YOUR_REGISTRY_HOST --docker-username=YOUR_REGISTRY_USER --docker-password=YOUR_REGISTRY_TOKEN
-kubectl -n claude-sandbox patch serviceaccount default -p '{"imagePullSecrets":[{"name":"share-regcred"}]}'
+docker build -t ghcr.io/chevvyy/share-app:1.0.0 .
+echo "$CLASSIC_TOKEN_WITH_write:packages" | docker login ghcr.io -u chevvyy --password-stdin
+docker push ghcr.io/chevvyy/share-app:1.0.0
 ```
-</details>
-
-<details>
-<summary>No registry: import the image straight into k3s</summary>
-
-Run this on the k3s node, or on every node in a multi-node cluster:
-
-```bash
-docker save YOUR_REGISTRY/share-app:1.0.0 | sudo k3s ctr images import -
-```
-
-`imagePullPolicy: IfNotPresent` then uses the local copy.
 </details>
 
 ### 3. One-time: let Traefik accept long-running uploads (cluster admin)
@@ -123,18 +114,18 @@ Traefik doesn't limit request body size by default (bodies are streamed unless a
 
 ### 4. Deploy from git with kubectl
 
-From the clone, after `git pull`:
+Run these from a machine whose kubeconfig can create PVCs in the namespace:
 
 ```bash
-git pull
+git clone https://github.com/chevvyy/share-app.git && cd share-app   # or: git pull
 kubectl apply -k k8s/
 kubectl -n claude-sandbox rollout status deploy/share --timeout=180s
 ```
 
-You can also apply straight from the remote repo. This needs `git` on the machine running kubectl. GitHub example:
+You can also apply straight from the remote repo. This needs `git` on the machine running kubectl, plus access to the private repo:
 
 ```bash
-kubectl apply -k "https://github.com/your-user/share-app//k8s?ref=main"
+kubectl apply -k "https://github.com/chevvyy/share-app//k8s?ref=main"
 ```
 
 ### 5. DNS and Cloudflare

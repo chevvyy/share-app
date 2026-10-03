@@ -15,8 +15,8 @@ resources:
   - service.yaml
   - ingress.yaml
 
-# >>> PLACEHOLDER: set this to the image you pushed (see README, step 3). <<<
+# Image built and pushed by .github/workflows/image.yml. Bump newTag when you release a new git tag.
 images:
   - name: share-app
-    newName: YOUR_REGISTRY/share-app
+    newName: ghcr.io/chevvyy/share-app
     newTag: "1.0.0"
