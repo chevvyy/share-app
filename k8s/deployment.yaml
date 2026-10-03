@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: share
 spec:
   # Exactly one replica: set state and limits live in this single process, and
-  # the local-path volume is ReadWriteOnce on one node. Recreate guarantees the
+  # the data volume is ReadWriteOnce. Recreate guarantees the
   # old pod has released the volume before the new one starts.
   replicas: 1
   strategy:

@@ -76,7 +76,7 @@ git commit -am "Deploy 1.0.1" && git push
 
 Watch the build at https://github.com/chevvyy/share-app/actions.
 
-**Letting the cluster pull the image.** GHCR packages start out private. Choose one:
+**Letting the cluster pull the image.** In `claude-sandbox`, the default ServiceAccount already has the `ghcr` pull secret, so nothing is needed there. For other namespaces, choose one:
 
 - **Make the package public** (simplest; it contains only this app's code, no secrets). Go to https://github.com/users/chevvyy/packages/container/share-app/settings → *Change visibility* → *Public*.
 - **Keep it private** and give the cluster a pull secret. Create a *classic* token with only `read:packages` at https://github.com/settings/tokens, then run:
@@ -175,13 +175,13 @@ Then open **https://share.howellsas.com** in a browser. Create a set, upload a f
 
 ---
 
-## Storage sizing (adjust to your disk)
+## Storage sizing (adjust to your NAS)
 
-`k8s/pvc.yaml` requests **55Gi**. That's the worst case of 10 sets × 5 GiB = 50 GiB, plus about 10% headroom for metadata and in-flight temp files.
+`k8s/pvc.yaml` requests **55Gi** on the `nfs-bulk` storage class (the NAS). That's the worst case of 10 sets × 5 GiB = 50 GiB, plus about 10% headroom for metadata and in-flight temp files.
 
-- k3s's `local-path` provisioner **does not enforce** PVC sizes. The data is a directory on one node's disk (default `/var/lib/rancher/k3s/storage`), so make sure that disk has the space.
+- NFS provisioners usually **don't enforce** the requested size, so make sure the share has the space.
 - The app checks the volume's real free space before every upload and answers `507 Insufficient Storage` instead of failing mid-write. `DISK_RESERVE_BYTES` (default 256 MiB) is always kept free.
-- If your node has less space, lower the PVC request **and** `MAX_SETS` / `MAX_SET_BYTES` in `k8s/deployment.yaml`.
+- If space is tight, lower the PVC request **and** `MAX_SETS` / `MAX_SET_BYTES` in `k8s/deployment.yaml`.
 
 ## Configuration (env vars, set in `k8s/deployment.yaml`)
 
@@ -222,7 +222,7 @@ All errors are JSON: `{"error":{"code":"…","message":"…","requestId":"…"}}
 
 ## Operational notes
 
-- **Single replica, `Recreate` strategy.** All state lives in one process on a ReadWriteOnce volume. Each deploy or restart causes a few seconds of downtime, and in-flight uploads must be restarted. Committed files and sets survive restarts because they're persisted in `meta.json` per set. Sets that expired while the app was down are deleted at startup.
+- **Single replica, `Recreate` strategy.** All state lives in one process on one volume. Each deploy or restart causes a few seconds of downtime, and in-flight uploads must be restarted. Committed files and sets survive restarts because they're persisted in `meta.json` per set. Sets that expired while the app was down are deleted at startup.
 - **Logs** are JSON lines on stdout/stderr. Set IDs are bearer secrets, so they are **never logged**. Logs show `set:<sha256 prefix>` instead, which still correlates log lines. If you enable Traefik access logs, note that they record request paths, which contain set IDs.
 - **Security:** downloads are always `application/octet-stream` + `Content-Disposition: attachment` + `nosniff`, so uploaded HTML can't run on the site. The UI is protected by a strict CSP and `Referrer-Policy: no-referrer`. Files are stored under random IDs, so client file names never touch the filesystem. The container runs as non-root UID 1000 with a read-only root filesystem, all capabilities dropped and the RuntimeDefault seccomp profile, which meets Pod Security "restricted".
 - **Abuse:** by design, anyone can create sets, so one person could hold all 10 slots for 6 hours. If that matters, rate-limit `POST /api/sets` at the edge, for example with a Cloudflare WAF rate-limiting rule or Cloudflare Access.

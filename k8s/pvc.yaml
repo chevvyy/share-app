@@ -1,14 +1,13 @@
-# Storage for uploaded files.
+# Storage for uploaded files, on the NAS (nfs-bulk, the homelab default class).
 #
 # SIZING ASSUMPTION: worst case is MAX_SETS (10) x MAX_SET_BYTES (5 GiB) = 50 GiB.
 # The request below adds ~10% headroom for metadata and in-flight temp files.
-# Adjust it to your node's disk capacity. If you shrink it below 50Gi, also
+# Adjust it to the NAS share's free space. If you shrink it below 50Gi, also
 # lower MAX_SETS or MAX_SET_BYTES in deployment.yaml.
 #
-# NOTE: k3s's local-path provisioner does NOT enforce this size. It is a
-# directory on the node's disk (default /var/lib/rancher/k3s/storage). The app
-# separately refuses uploads (HTTP 507) when the volume's real free space runs
-# low, so a full disk degrades cleanly instead of failing mid-write.
+# NOTE: NFS provisioners usually do not enforce the requested size. The app
+# separately checks the volume's real free space before every upload and
+# answers HTTP 507 when it runs low, so a full share degrades cleanly.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -16,7 +15,7 @@ metadata:
   labels:
     app.kubernetes.io/name: share
 spec:
-  storageClassName: local-path
+  storageClassName: nfs-bulk
   accessModes:
     - ReadWriteOnce
   resources:
