@@ -1,0 +1,40 @@
+# Routes share.howellsas.com to the app through k3s's bundled Traefik.
+#
+# Kubernetes requires lowercase host names in Ingress rules. DNS is
+# case-insensitive, so "share.Howellsas.com" in a browser matches this rule.
+#
+# Large uploads: Traefik does not limit request body size (it streams bodies
+# unless a Buffering middleware is attached, and none is). Traefik v3 does,
+# however, abort any request whose body takes longer than 60 s to read. Apply
+# traefik/helmchartconfig.yaml once per cluster to lift that (see README).
+# The web UI also uploads in 32 MiB chunks, so each request stays under that
+# timeout and under Cloudflare's 100 MB per-request body limit.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: share
+  labels:
+    app.kubernetes.io/name: share
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    # --- Optional HTTPS certificate via cert-manager ---
+    # Uncomment, set your ClusterIssuer, and uncomment the "tls:" block below.
+    # Without it, HTTPS on websecure still works with Traefik's default certificate.
+    # cert-manager.io/cluster-issuer: YOUR_CLUSTER_ISSUER
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: share.howellsas.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: share
+                port:
+                  name: http
+  # tls:
+  #   - hosts:
+  #       - share.howellsas.com
+  #     secretName: share-tls

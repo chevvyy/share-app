@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: share
+  labels:
+    app.kubernetes.io/name: share
+spec:
+  # Exactly one replica: set state and limits live in this single process, and
+  # the local-path volume is ReadWriteOnce on one node. Recreate guarantees the
+  # old pod has released the volume before the new one starts.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: share
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: share
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: share
+          image: share-app # rewritten by kustomization.yaml "images:"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: MAX_SETS
+              value: "10"
+            - name: MAX_SET_BYTES
+              value: "5368709120" # 5 GiB
+            - name: MAX_TTL_SECONDS
+              value: "21600" # 6 h (also the hard maximum in code)
+            - name: SWEEP_INTERVAL_SECONDS
+              value: "15"
+            # Browser uploads are split into chunks of this size so that no single
+            # request exceeds a proxy body limit (Cloudflare Free/Pro: 100 MB) or
+            # Traefik v3's default 60 s read timeout (32 MiB needs >= ~4.5 Mbit/s).
+            - name: CHUNK_BYTES
+              value: "33554432" # 32 MiB
+            - name: UPLOAD_SESSION_IDLE_SECONDS
+              value: "900"
+            - name: IDLE_TIMEOUT_SECONDS
+              value: "120"
+            - name: SHUTDOWN_GRACE_SECONDS
+              value: "20"
+            - name: LOG_LEVEL
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: share-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

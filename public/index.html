@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Share — temporary file sets</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1><a href="/">Share</a></h1>
+    <p class="tagline">Temporary file sets. Anyone with the ID can upload and download. Everything is deleted automatically.</p>
+  </header>
+
+  <main>
+    <div id="message" class="message" role="alert" hidden></div>
+
+    <section id="home">
+      <div class="card">
+        <h2>Create a file set</h2>
+        <form id="create-form">
+          <label for="ttl">Delete after</label>
+          <select id="ttl" name="ttl" required></select>
+          <button type="submit">Create file set</button>
+        </form>
+        <p class="hint" id="limits-hint"></p>
+      </div>
+
+      <div class="card">
+        <h2>Open an existing file set</h2>
+        <form id="open-form">
+          <label for="open-id">File set ID</label>
+          <input id="open-id" name="id" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="43-character ID" required minlength="43" maxlength="200">
+          <button type="submit">Open</button>
+        </form>
+      </div>
+    </section>
+
+    <section id="set-view" hidden>
+      <div class="card">
+        <div class="set-header">
+          <h2>File set</h2>
+          <button type="button" id="close-set" class="secondary">Close</button>
+        </div>
+        <p class="warn">Anyone who has this ID can view, upload, download, and delete files. Share it carefully.</p>
+        <div class="field">
+          <span class="label">ID</span>
+          <code id="set-id"></code>
+          <button type="button" id="copy-id" class="secondary small">Copy ID</button>
+        </div>
+        <div class="field">
+          <span class="label">Link</span>
+          <code id="share-link"></code>
+          <button type="button" id="copy-link" class="secondary small">Copy link</button>
+        </div>
+        <div class="field">
+          <span class="label">Deleted in</span>
+          <strong id="countdown">—</strong>
+          <span class="muted" id="expires-at"></span>
+        </div>
+        <div class="field">
+          <span class="label">Storage</span>
+          <progress id="usage-bar" max="1" value="0"></progress>
+          <span id="usage-text" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Upload files</h2>
+        <form id="upload-form">
+          <input id="files" type="file" multiple required>
+          <button type="submit" id="upload-btn">Upload</button>
+          <button type="button" id="cancel-upload" class="secondary" hidden>Cancel upload</button>
+        </form>
+        <ul id="upload-status" class="upload-status"></ul>
+      </div>
+
+      <div class="card">
+        <div class="set-header">
+          <h2>Files</h2>
+          <button type="button" id="refresh" class="secondary small">Refresh</button>
+        </div>
+        <p id="empty-msg" class="muted">No files yet.</p>
+        <table id="file-table" hidden>
+          <thead><tr><th>Name</th><th class="num">Size</th><th>Uploaded</th><th></th></tr></thead>
+          <tbody id="file-list"></tbody>
+        </table>
+      </div>
+
+      <div class="card danger-zone">
+        <button type="button" id="delete-set" class="danger">Delete this file set now</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

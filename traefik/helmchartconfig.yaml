@@ -1,0 +1,28 @@
+# Cluster-level Traefik settings for long-running uploads (k3s bundled Traefik v3).
+# Apply ONCE, as a cluster admin. It is not part of k8s/ because it lives in kube-system:
+#
+#   kubectl get helmchartconfig traefik -n kube-system   # if this exists, MERGE the values below into it
+#   kubectl apply -f traefik/helmchartconfig.yaml
+#
+# Why: since v3.0, Traefik entrypoints default to readTimeout=60s, which is the
+# maximum time to read an entire request INCLUDING its body. Any upload taking
+# longer than 60 s (e.g. 5 GiB at under ~700 Mbit/s) would be cut off.
+# 6 h matches the app's maximum file-set lifetime, since no upload can usefully
+# outlive its set. This applies to every site on these entrypoints.
+#
+# k3s's helm-controller re-renders Traefik when this object changes. Check with:
+#   kubectl -n kube-system get deploy traefik -o jsonpath='{.spec.template.spec.containers[0].args}'
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    additionalArguments:
+      - "--entryPoints.web.transport.respondingTimeouts.readTimeout=6h"
+      - "--entryPoints.web.transport.respondingTimeouts.writeTimeout=6h"
+      - "--entryPoints.web.transport.respondingTimeouts.idleTimeout=180s"
+      - "--entryPoints.websecure.transport.respondingTimeouts.readTimeout=6h"
+      - "--entryPoints.websecure.transport.respondingTimeouts.writeTimeout=6h"
+      - "--entryPoints.websecure.transport.respondingTimeouts.idleTimeout=180s"

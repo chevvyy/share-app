@@ -1,0 +1,15 @@
+{
+  "name": "share-app",
+  "version": "1.0.0",
+  "description": "Temporary file-sharing site: ID-addressed file sets that expire automatically.",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  }
+}
