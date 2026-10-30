@@ -15,8 +15,12 @@ metadata:
   name: share
   labels:
     app.kubernetes.io/name: share
+    homelab.io/exposure: public
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    # Required by Kyverno's claude-exposure-guard (added when this Ingress was recreated in its
+    # own namespace, 2026-10-30 -- the original predated that policy and was never re-validated).
+    homelab.io/public-reason: "Temporary file sharing; link-based, size/TTL limited by the app itself"
     # --- Optional HTTPS certificate via cert-manager ---
     # Uncomment, set your ClusterIssuer, and uncomment the "tls:" block below.
     # Without it, HTTPS on websecure still works with Traefik's default certificate.

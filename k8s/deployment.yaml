@@ -18,8 +18,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: share
+        homelab.io/app: share
     spec:
       automountServiceAccountToken: false
+      imagePullSecrets: [{name: ghcr}]   # cloned into every Claude namespace by Kyverno
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

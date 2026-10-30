@@ -8,6 +8,11 @@
 # NOTE: NFS provisioners usually do not enforce the requested size. The app
 # separately checks the volume's real free space before every upload and
 # answers HTTP 507 when it runs low, so a full share degrades cleanly.
+#
+# volumeName pins this PVC to the exact PV that held the data in claude-sandbox
+# (homelab-ops DECISIONS 2026-10-30, Q6's namespace move) -- NFS-backed, Retain
+# reclaim policy, so the same files bind in here with no copy needed. Remove
+# volumeName only if you are intentionally starting from an empty volume.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -15,6 +20,7 @@ metadata:
   labels:
     app.kubernetes.io/name: share
 spec:
+  volumeName: pvc-347adea2-a8cf-47dd-956c-8caf09980399
   storageClassName: nfs-bulk
   accessModes:
     - ReadWriteOnce
