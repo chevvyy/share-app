@@ -5,10 +5,13 @@ const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const http = require('node:http');
 const path = require('node:path');
-const { Transform } = require('node:stream');
+const zlib = require('node:zlib');
+const { Readable, Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { HttpError } = require('./errors');
 const { setRef, redactIds } = require('./logger');
+const { sanitizeFolderPath, comparePathName, MAX_PATH_DEPTH, MAX_PATH_CHARS } = require('./paths');
+const { planZip, entryNames } = require('./zip');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const STATIC_FILES = {
@@ -36,6 +39,7 @@ const FILES_ROUTE = /^\/api\/sets\/([^/]+)\/files$/;
 const FILE_ROUTE = /^\/api\/sets\/([^/]+)\/files\/([^/]+)$/;
 const UPLOADS_ROUTE = /^\/api\/sets\/([^/]+)\/uploads$/;
 const UPLOAD_ROUTE = /^\/api\/sets\/([^/]+)\/uploads\/([^/]+)$/;
+const ARCHIVE_ROUTE = /^\/api\/sets\/([^/]+)\/archive$/;
 const QUIET_PATHS = new Set(['/healthz', '/readyz']);
 
 function loadStaticAssets() {
@@ -179,6 +183,7 @@ async function streamBodyInto(req, upload, start, expected) {
         return;
       }
       upload.received = start + got;
+      upload.crc = zlib.crc32(chunk, upload.crc);
       cb(null, chunk);
     },
   });
@@ -207,7 +212,9 @@ function setView(set, config) {
 }
 
 function fileView(file) {
-  return { id: file.id, name: file.name, size: file.size, uploadedAt: new Date(file.uploadedAt).toISOString() };
+  return {
+    id: file.id, name: file.name, path: file.path, size: file.size, uploadedAt: new Date(file.uploadedAt).toISOString(),
+  };
 }
 
 // ------------------------------------------------------------------ server
@@ -268,10 +275,11 @@ function createServer({ config, store, log, state }) {
   /** Single-request upload: the request body is the whole file. */
   async function handleUpload(req, res, ctx, set, url) {
     const name = sanitizeFileName(url.searchParams.get('name'));
+    const folder = sanitizeFolderPath(url.searchParams.get('path'));
     const length = requireContentLength(req);
 
     // Reserves quota; throws 413/409/507 before we accept a single body byte.
-    const upload = await store.beginUpload(set, name, length);
+    const upload = await store.beginUpload(set, name, length, { path: folder });
     upload.cancel = () => req.destroy();
     ctx.fileId = upload.id;
     if (req.expectsContinue) res.writeContinue();
@@ -291,7 +299,8 @@ function createServer({ config, store, log, state }) {
     const body = await readJson(req);
     const name = sanitizeFileName(body?.name);
     const size = parseSize(body?.size, 'size');
-    const upload = await store.beginUpload(set, name, size, { chunked: true });
+    const folder = sanitizeFolderPath(body?.path);
+    const upload = await store.beginUpload(set, name, size, { chunked: true, path: folder });
     ctx.fileId = upload.id;
     log.info('upload session started', { reqId: ctx.reqId, set: setRef(set.id), fileId: upload.id, bytes: size });
     if (size === 0) return commitAndRespond(res, set, upload);
@@ -326,10 +335,12 @@ function createServer({ config, store, log, state }) {
     upload.busy = true;
     upload.cancel = () => req.destroy();
     if (req.expectsContinue) res.writeContinue();
+    const crcBefore = upload.crc;
     try {
       await streamBodyInto(req, upload, offset, length);
     } catch (err) {
       upload.received = offset; // discard the partial chunk; the client retries from the same offset
+      upload.crc = crcBefore;
       throw uploadFailure(err, req, ctx, set, upload);
     } finally {
       upload.busy = false;
@@ -402,6 +413,80 @@ function createServer({ config, store, log, state }) {
     }
   }
 
+  /** Stream one folder (`?path=P`) or the whole set as a stored ZIP with an exact Content-Length. */
+  async function handleArchive(req, res, ctx, set, url) {
+    const prefix = sanitizeFolderPath(url.searchParams.get('path'));
+    // Committed files only: uploads still in progress are not in set.files.
+    const files = [...set.files.values()]
+      .filter((f) => !prefix || f.path === prefix || f.path.startsWith(`${prefix}/`))
+      .sort(comparePathName);
+    if (files.length === 0) {
+      throw new HttpError(404, 'NOTHING_TO_ARCHIVE', 'There are no files in that folder.');
+    }
+    try {
+      await store.ensureCrcs(set, files);
+    } catch (err) {
+      // A file deleted (or the set expiring) meanwhile; the raw error would log a path containing the set ID.
+      if (err.code !== 'ENOENT') throw err;
+      if (set.deleted) throw setNotFound();
+      throw new HttpError(409, 'ARCHIVE_CHANGED', 'Files changed while the archive was being prepared. Please try again.');
+    }
+    if (set.deleted) throw setNotFound();
+
+    const names = entryNames(files, prefix);
+    const plan = planZip(files.map((f, i) => ({ name: names[i], size: f.size, crc32: f.crc32, mtime: f.uploadedAt })));
+    const label = prefix ? prefix.slice(prefix.lastIndexOf('/') + 1) : 'share-files';
+    res.writeHead(200, {
+      'Content-Type': 'application/zip',
+      'Content-Disposition': contentDisposition(`${label}.zip`),
+      'Content-Length': plan.length,
+      'Accept-Ranges': 'none',
+      'Cache-Control': 'private, no-store',
+    });
+    if (req.method === 'HEAD') {
+      res.end();
+      return;
+    }
+
+    async function* body() {
+      for (const part of plan.parts) {
+        if (part.buffer) {
+          yield part.buffer;
+          continue;
+        }
+        if (part.size === 0) continue;
+        const file = files[part.index];
+        let sent = 0;
+        for await (const chunk of fs.createReadStream(store.filePath(set, file))) {
+          sent += chunk.length;
+          if (sent > part.size) break;
+          yield chunk;
+        }
+        // A short or changed file would corrupt every offset after it: abort instead.
+        if (sent !== part.size) throw new Error('archived file changed size while streaming');
+      }
+    }
+
+    const stream = Readable.from(body(), { objectMode: false });
+    set.downloads.add(stream); // expiry or delete destroys it, aborting the response
+    try {
+      await pipeline(stream, res);
+      log.info('archive downloaded', {
+        reqId: ctx.reqId, set: setRef(set.id), files: files.length, bytes: plan.length, zip64: plan.zip64,
+      });
+    } catch (err) {
+      if (res.headersSent && (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.code === 'ECONNRESET'
+          || err.code === 'ENOENT' || set.deleted)) {
+        log.info('archive download aborted', { reqId: ctx.reqId, set: setRef(set.id) });
+        res.destroy();
+        return;
+      }
+      throw err;
+    } finally {
+      set.downloads.delete(stream);
+    }
+  }
+
   async function handleReady(res) {
     if (!store.ready || state.shuttingDown) {
       sendJson(res, 503, { status: state.shuttingDown ? 'shutting-down' : 'starting' });
@@ -454,6 +539,8 @@ function createServer({ config, store, log, state }) {
         maxSetBytes: config.maxSetBytes,
         maxFilesPerSet: config.maxFilesPerSet,
         chunkBytes: config.chunkBytes,
+        maxPathDepth: MAX_PATH_DEPTH,
+        maxPathChars: MAX_PATH_CHARS,
         ...store.stats(),
       });
     }
@@ -502,6 +589,12 @@ function createServer({ config, store, log, state }) {
         return sendNoContent(res);
       }
       throw methodNotAllowed(['PUT', 'DELETE']);
+    }
+    if ((m = ARCHIVE_ROUTE.exec(p))) {
+      if (method !== 'GET' && method !== 'HEAD') throw methodNotAllowed(['GET', 'HEAD']);
+      const set = getSet(m[1]);
+      ctx.set = setRef(set.id);
+      return handleArchive(req, res, ctx, set, url);
     }
     const asset = assets.get(p);
     if (asset) {
@@ -602,4 +695,4 @@ function createServer({ config, store, log, state }) {
   return server;
 }
 
-module.exports = { createServer, sanitizeFileName, parseRange, contentDisposition };
+module.exports = { createServer, sanitizeFileName, sanitizeFolderPath, parseRange, contentDisposition };

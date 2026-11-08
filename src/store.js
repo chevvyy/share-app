@@ -1,9 +1,12 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const { HttpError } = require('./errors');
+const { sanitizeFolderPath } = require('./paths');
 const { setRef } = require('./logger');
 const { formatBytes, formatDuration } = require('./format');
 
@@ -18,6 +21,17 @@ const newFileId = () => crypto.randomBytes(16).toString('base64url');
 
 const isValidSetId = (id) => typeof id === 'string' && SET_ID_RE.test(id);
 const isValidFileId = (id) => typeof id === 'string' && FILE_ID_RE.test(id);
+const isValidCrc = (v) => Number.isInteger(v) && v >= 0 && v <= 0xffffffff;
+
+/** Folder path from a stored file record; records from before folder support have none. */
+function storedPath(raw) {
+  if (typeof raw !== 'string') return '';
+  try {
+    return sanitizeFolderPath(raw);
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Owns all file-set state. In-memory state is authoritative while running and
@@ -135,7 +149,9 @@ class SetStore {
         continue;
       }
       const st = await fsp.stat(path.join(this.filesDir(id), f.id));
-      set.files.set(f.id, { id: f.id, name: f.name, size: st.size, uploadedAt: f.uploadedAt });
+      const file = { id: f.id, name: f.name, size: st.size, uploadedAt: f.uploadedAt, path: storedPath(f.path) };
+      if (isValidCrc(f.crc32)) file.crc32 = f.crc32;
+      set.files.set(f.id, file);
       set.usedBytes += st.size;
       onDisk.delete(f.id);
     }
@@ -295,7 +311,7 @@ class SetStore {
    * Reserve `length` bytes of the set's quota for a new upload. Reservations
    * make the per-set cap hold across concurrent uploads, not just sequential ones.
    */
-  async beginUpload(set, name, length, { chunked = false } = {}) {
+  async beginUpload(set, name, length, { chunked = false, path: folder = '' } = {}) {
     const { maxSetBytes, maxFilesPerSet } = this.config;
     if (set.files.size + set.uploads.size >= maxFilesPerSet) {
       throw new HttpError(409, 'TOO_MANY_FILES', `A file set can hold at most ${maxFilesPerSet} files.`);
@@ -311,7 +327,9 @@ class SetStore {
     const id = newFileId();
     const upload = {
       id, set, name, length, chunked,
+      path: folder,            // validated folder path ('' = top level); metadata only
       received: 0,
+      crc: 0,                  // running CRC-32 of the bytes received so far
       busy: !chunked,          // a request is currently writing to this upload
       lastActivity: Date.now(),
       released: false,
@@ -368,7 +386,10 @@ class SetStore {
     }
     const finalPath = path.join(this.filesDir(set.id), upload.id);
     await fsp.rename(upload.tmpPath, finalPath);
-    const file = { id: upload.id, name: upload.name, size: upload.received, uploadedAt: Date.now() };
+    const file = {
+      id: upload.id, name: upload.name, size: upload.received, uploadedAt: Date.now(),
+      path: upload.path, crc32: upload.crc >>> 0,
+    };
     this.releaseUpload(upload);
     set.files.set(file.id, file);
     set.usedBytes += file.size;
@@ -410,6 +431,22 @@ class SetStore {
 
   getFile(set, fileId) {
     return isValidFileId(fileId) ? set.files.get(fileId) ?? null : null;
+  }
+
+  /**
+   * Files uploaded before CRCs were tracked have none; a ZIP entry needs one up
+   * front. Compute those once by reading the file, then persist them.
+   */
+  async ensureCrcs(set, files) {
+    let changed = false;
+    for (const file of files) {
+      if (isValidCrc(file.crc32)) continue;
+      let crc = 0;
+      for await (const chunk of fs.createReadStream(this.filePath(set, file))) crc = zlib.crc32(chunk, crc);
+      file.crc32 = crc >>> 0;
+      changed = true;
+    }
+    if (changed) await this.persist(set);
   }
 }
 

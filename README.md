@@ -7,10 +7,14 @@ A temporary file-sharing site for a k3s cluster, served at **https://share.howel
 
 Users create a **file set** and get back a 43-character random ID (256 bits from `crypto.randomBytes`). Anyone holding the ID can upload, download and delete files in that set, and the ID is the only access control. Each set is deleted automatically after a time the user chooses, at most **6 hours**.
 
+**Folders.** Pick a folder ("Choose folder") or drag one or more folders and files onto the upload box, and the set keeps the folder structure. The file list groups files by folder, and any folder, or the whole set, downloads as one `.zip`. The folder path is metadata only: files are still stored on disk under random IDs. Empty folders and OS junk files (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*`) are skipped.
+
 | Limit | Default | Enforced |
 |---|---|---|
 | Time until deletion | 1 min to 6 h (6 h is also a hard cap in code) | Server-side. A background sweeper deletes expired sets every 15 s, whether or not anyone visits the site. |
 | Bytes per file set | 5 GiB | Server-side, across all uploads, including concurrent ones. The full size of each upload is reserved before any byte is accepted. |
+| Files per file set | 1000 | Server-side. The browser checks a whole folder against it first and uploads nothing if it doesn't fit. |
+| Folder paths | 32 levels, 1024 characters, 255 per folder name | Server-side (`400 INVALID_PATH`), plus a browser pre-check |
 | File sets at once | 10 | Server-side. Creating an 11th returns `409` plus `Retry-After`. |
 
 Uploads and downloads are streamed straight to and from disk, so memory stays flat: measured peak RSS was about 96 MB while moving 12 GB. Downloads support `Range` requests, so they can be resumed.
@@ -28,11 +32,13 @@ Uploads and downloads are streamed straight to and from disk, so memory stays fl
 │   ├── config.js       # env-var configuration with validation
 │   ├── server.js       # HTTP routing, streaming upload/download, validation, security headers
 │   ├── store.js        # file-set state, quotas/reservations, persistence, expiry sweeper
+│   ├── paths.js        # folder-path validation and ordering
+│   ├── zip.js          # stored (uncompressed) ZIP/ZIP64 writer for folder downloads
 │   ├── logger.js       # JSON-lines logging (set IDs are never logged, only a hash)
 │   ├── errors.js
 │   └── format.js
 ├── public/             # index.html, app.js, style.css (the web UI)
-├── test/integration.test.js
+├── test/               # integration.test.js (real server process), zip.test.js (ZIP64 header math)
 ├── .github/workflows/image.yml    # CI: test, build, push image to ghcr.io
 ├── k8s/                # kustomization.yaml, pvc.yaml, deployment.yaml, service.yaml, ingress.yaml
 └── traefik/helmchartconfig.yaml   # one-time cluster setting for long uploads (kube-system)
@@ -41,7 +47,7 @@ Uploads and downloads are streamed straight to and from disk, so memory stays fl
 ## Run and test locally
 
 ```bash
-npm test                                   # 16 end-to-end tests against a real server process
+npm test                                   # 22 end-to-end tests against a real server process + 4 ZIP unit tests
 DATA_DIR=./data PORT=8080 npm start        # then open http://localhost:8080
 ```
 
@@ -53,7 +59,7 @@ DATA_DIR=./data PORT=8080 npm start        # then open http://localhost:8080
 |---|---|
 | Source | https://github.com/chevvyy/share-app (private) |
 | Image | `ghcr.io/chevvyy/share-app`, built by GitHub Actions (`.github/workflows/image.yml`) |
-| Namespace | `claude-sandbox` (change `namespace:` in `k8s/kustomization.yaml` to use another) |
+| Namespace | `share` (change `namespace:` in `k8s/kustomization.yaml` to use another) |
 
 ### 1. Push to git
 
@@ -76,15 +82,15 @@ git commit -am "Deploy 1.0.1" && git push
 
 Watch the build at https://github.com/chevvyy/share-app/actions.
 
-**Letting the cluster pull the image.** In `claude-sandbox`, the default ServiceAccount already has the `ghcr` pull secret, so nothing is needed there. For other namespaces, choose one:
+**Letting the cluster pull the image.** The `share` namespace already has the `ghcr` pull secret, so nothing is needed there. For other namespaces, choose one:
 
 - **Make the package public** (simplest; it contains only this app's code, no secrets). Go to https://github.com/users/chevvyy/packages/container/share-app/settings → *Change visibility* → *Public*.
 - **Keep it private** and give the cluster a pull secret. Create a *classic* token with only `read:packages` at https://github.com/settings/tokens, then run:
 
   ```bash
-  kubectl -n claude-sandbox create secret docker-registry ghcr-pull \
+  kubectl -n share create secret docker-registry ghcr-pull \
     --docker-server=ghcr.io --docker-username=chevvyy --docker-password=PASTE_CLASSIC_TOKEN
-  kubectl -n claude-sandbox patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+  kubectl -n share patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
   ```
 
 <details>
@@ -119,7 +125,7 @@ Run these from a machine whose kubeconfig can create PVCs in the namespace:
 ```bash
 git clone https://github.com/chevvyy/share-app.git && cd share-app   # or: git pull
 kubectl apply -k k8s/
-kubectl -n claude-sandbox rollout status deploy/share --timeout=180s
+kubectl -n share rollout status deploy/share --timeout=180s
 ```
 
 You can also apply straight from the remote repo. This needs `git` on the machine running kubectl, plus access to the private repo:
@@ -149,8 +155,8 @@ Kubernetes requires lowercase Ingress hosts, so the rule uses `share.howellsas.c
 
 ```bash
 # Resources are up and the PVC is Bound
-kubectl -n claude-sandbox get deploy,pods,svc,ingress,pvc -l app.kubernetes.io/part-of=share
-kubectl -n claude-sandbox logs deploy/share --tail=20
+kubectl -n share get deploy,pods,svc,ingress,pvc -l app.kubernetes.io/part-of=share
+kubectl -n share logs deploy/share --tail=20
 
 # Health through Traefik on the LAN (bypasses DNS/Cloudflare). Use any Traefik LoadBalancer IP:
 LB=$(kubectl -n kube-system get svc traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
@@ -166,12 +172,14 @@ echo "hello from share-app" > hello.txt
 FID=$(curl -s --max-time 30 -X POST -T hello.txt "$BASE/api/sets/$ID/files?name=hello.txt" \
      | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s --max-time 30 "$BASE/api/sets/$ID/files/$FID"                           # prints the file
+curl -s --max-time 30 -X POST -T hello.txt "$BASE/api/sets/$ID/files?name=hello.txt&path=Docs/2026" >/dev/null
+curl -s --max-time 30 -o docs.zip "$BASE/api/sets/$ID/archive?path=Docs" && unzip -l docs.zip   # 2026/hello.txt
 curl -s --max-time 10 -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
      -d '{"ttlSeconds":21601}' $BASE/api/sets                                     # 400: over 6 h
 curl -s --max-time 10 -X DELETE -o /dev/null -w '%{http_code}\n' "$BASE/api/sets/$ID"   # 204
 ```
 
-Then open **https://share.howellsas.com** in a browser. Create a set, upload a file larger than 100 MB (this exercises chunking), check the countdown and storage bar, download the file, and delete the set.
+Then open **https://share.howellsas.com** in a browser. Create a set, upload a file larger than 100 MB (this exercises chunking), check the countdown and storage bar, download the file, and delete the set. For folders: pick a folder with nested subfolders, drag two folders at once, then download a folder `.zip` and open it.
 
 ---
 
@@ -208,16 +216,17 @@ All errors are JSON: `{"error":{"code":"…","message":"…","requestId":"…"}}
 
 | Method & path | Body | Result |
 |---|---|---|
-| `GET /api/config` | | Limits and current set count |
+| `GET /api/config` | | Limits (including `maxPathDepth`, `maxPathChars`) and current set count |
 | `POST /api/sets` | `{"ttlSeconds": 3600}` | `201` with the set, including `id` and `expiresAt` · `400 INVALID_TTL` · `409 SET_LIMIT_REACHED` |
 | `GET /api/sets/{id}` | | Set info, file list, `remainingSeconds`, usage · `404` |
 | `DELETE /api/sets/{id}` | | `204`. Deletes the set and its files now. |
-| `POST /api/sets/{id}/files?name=N` | raw file bytes (`Content-Length` required) | `201`. Single-request upload. · `411` · `413 SET_QUOTA_EXCEEDED` · `507` |
-| `POST /api/sets/{id}/uploads` | `{"name":"a.iso","size":123}` | `201 {uploadId}`. Starts a chunked upload and reserves `size`. |
+| `POST /api/sets/{id}/files?name=N[&path=P]` | raw file bytes (`Content-Length` required) | `201`. Single-request upload. `path` is the folder, e.g. `Vacation/2026/raw` (optional; missing = top level). · `400 INVALID_PATH` · `411` · `413 SET_QUOTA_EXCEEDED` · `507` |
+| `POST /api/sets/{id}/uploads` | `{"name":"a.iso","size":123,"path":"P"}` (`path` optional) | `201 {uploadId}`. Starts a chunked upload and reserves `size`. · `400 INVALID_PATH` |
 | `PUT /api/sets/{id}/uploads/{uploadId}?offset=N` | raw chunk bytes | `200 {received}`, or `201 {file}` on the last chunk · `409 OFFSET_MISMATCH {expectedOffset}` to resume |
 | `DELETE /api/sets/{id}/uploads/{uploadId}` | | `204`. Cancels the upload and releases its quota. |
 | `GET /api/sets/{id}/files/{fileId}` | | The file as an attachment (`Range` supported) |
 | `DELETE /api/sets/{id}/files/{fileId}` | | `204`. Frees the file's quota. |
+| `GET`/`HEAD /api/sets/{id}/archive[?path=P]` | | Folder `P` (with its subfolders), or the whole set, as one `.zip`. Stored entries (no compression), ZIP64 when needed, exact `Content-Length`, no `Range`. Same-named files get ` (2)`, ` (3)`. Uploads still in progress are left out. · `404 NOTHING_TO_ARCHIVE` · `400 INVALID_PATH` |
 | `GET /healthz`, `GET /readyz` | | Liveness and readiness (readiness checks the data volume is writable) |
 
 ## Operational notes

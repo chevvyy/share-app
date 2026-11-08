@@ -17,6 +17,9 @@ process.on('uncaughtException', (err) => {
 });
 
 async function main() {
+  if (typeof require('node:zlib').crc32 !== 'function') {
+    throw new Error(`zlib.crc32 is missing: share-app needs Node.js 22.2 or newer (running ${process.version})`);
+  }
   const config = loadConfig();
   log = createLogger(config.logLevel);
   const { dataDir, maxSets, maxSetBytes, minTtlSeconds, maxTtlSeconds } = config;

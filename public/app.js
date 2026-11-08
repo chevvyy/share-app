@@ -5,6 +5,8 @@
   const TTL_PRESETS_MIN = [5, 15, 30, 60, 120, 180, 240, 300, 360];
   const DEFAULT_CHUNK_BYTES = 32 * 1024 * 1024;
   const MAX_CHUNK_RETRIES = 6;
+  const PARALLEL_SMALL_UPLOADS = 3;
+  const JUNK_NAMES = new Set(['.ds_store', 'thumbs.db', 'desktop.ini']);
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -14,8 +16,10 @@
     setId: $('set-id'), shareLink: $('share-link'), copyId: $('copy-id'), copyLink: $('copy-link'),
     countdown: $('countdown'), expiresAt: $('expires-at'), usageBar: $('usage-bar'), usageText: $('usage-text'),
     uploadForm: $('upload-form'), files: $('files'), uploadBtn: $('upload-btn'), cancelUpload: $('cancel-upload'),
+    uploadCard: $('upload-card'), chooseFolder: $('choose-folder'), folder: $('folder'),
+    overall: $('overall'), overallBar: $('overall-bar'), overallText: $('overall-text'),
     uploadStatus: $('upload-status'), fileTable: $('file-table'), fileList: $('file-list'), emptyMsg: $('empty-msg'),
-    refresh: $('refresh'), deleteSet: $('delete-set'), closeSet: $('close-set'),
+    downloadAll: $('download-all'), refresh: $('refresh'), deleteSet: $('delete-set'), closeSet: $('close-set'),
   };
 
   const state = {
@@ -24,9 +28,11 @@
     clockOffsetMs: 0, // server clock minus local clock
     timer: null,
     uploading: false,
-    currentXhr: null,
+    xhrs: new Set(), // upload requests in flight (up to PARALLEL_SMALL_UPLOADS + 1)
     cancelRequested: false,
   };
+
+  const abortAll = () => { for (const xhr of state.xhrs) xhr.abort(); };
 
   // ---------------------------------------------------------------- helpers
 
@@ -186,16 +192,60 @@
     if (!state.timer) state.timer = setInterval(tick, 1000);
   }
 
+  /** Folder by folder (segment-wise, so subfolders follow their parent), then by name. */
+  function comparePathName(a, b) {
+    const pa = a.path ? a.path.split('/') : [];
+    const pb = b.path ? b.path.split('/') : [];
+    for (let i = 0; i < Math.min(pa.length, pb.length); i += 1) {
+      if (pa[i] !== pb[i]) return pa[i].localeCompare(pb[i], undefined, { numeric: true }) || (pa[i] < pb[i] ? -1 : 1);
+    }
+    if (pa.length !== pb.length) return pa.length - pb.length;
+    return a.name.localeCompare(b.name, undefined, { numeric: true });
+  }
+
+  const indent = (cell, depth) => { if (depth > 0) cell.style.paddingLeft = `${0.4 + depth * 1.25}rem`; };
+  const archiveUrl = (setId, folder) => `${setUrl(setId)}/archive${folder ? `?path=${encodeURIComponent(folder)}` : ''}`;
+
+  function folderRow(set, segments) {
+    const tr = document.createElement('tr');
+    tr.className = 'folder';
+    const name = document.createElement('td');
+    name.className = 'name';
+    name.colSpan = 3;
+    name.textContent = `${segments.at(-1)}/`;
+    indent(name, segments.length - 1);
+    const actions = document.createElement('td');
+    actions.className = 'actions';
+    const link = document.createElement('a');
+    link.href = archiveUrl(set.id, segments.join('/'));
+    link.textContent = 'Download folder (.zip)';
+    actions.append(link);
+    tr.append(name, actions);
+    return tr;
+  }
+
   function renderFiles(set) {
     el.fileList.replaceChildren();
     el.emptyMsg.hidden = set.files.length > 0;
     el.fileTable.hidden = set.files.length === 0;
-    for (const file of set.files) {
+    el.downloadAll.hidden = set.files.length < 2;
+    el.downloadAll.href = archiveUrl(set.id, '');
+    let prev = [];
+    for (const file of [...set.files].sort(comparePathName)) {
+      const segments = file.path ? file.path.split('/') : [];
+      let common = 0;
+      while (common < prev.length && common < segments.length && prev[common] === segments[common]) common += 1;
+      for (let depth = common; depth < segments.length; depth += 1) {
+        el.fileList.append(folderRow(set, segments.slice(0, depth + 1)));
+      }
+      prev = segments;
+
       const tr = document.createElement('tr');
 
       const name = document.createElement('td');
       name.className = 'name';
       name.textContent = file.name;
+      indent(name, segments.length);
 
       const size = document.createElement('td');
       size.className = 'num';
@@ -231,7 +281,7 @@
       el.countdown.classList.add('soon');
       const id = state.set.id;
       closeSet(false);
-      if (state.currentXhr) state.currentXhr.abort();
+      abortAll();
       showMessage('This file set has expired and its files have been deleted.');
       if (location.hash.slice(1) === id) history.replaceState(null, '', location.pathname);
       return;
@@ -254,9 +304,9 @@
   }
 
   function closeSet(updateHash = true) {
-    if (state.uploading && state.currentXhr) {
+    if (state.uploading) {
       state.cancelRequested = true;
-      state.currentXhr.abort();
+      abortAll();
     }
     state.set = null;
     clearInterval(state.timer);
@@ -264,6 +314,7 @@
     el.setView.hidden = true;
     el.home.hidden = false;
     el.uploadStatus.replaceChildren();
+    el.overall.hidden = true;
     if (updateHash && location.hash) history.pushState(null, '', location.pathname);
     loadConfig();
   }
@@ -293,11 +344,12 @@
 
   // ---------------------------------------------------------------- uploads
 
-  function addStatusRow(file) {
+  /** A per-file row, shown only while the file is uploading or after it failed. */
+  function addStatusRow(file, folder, onProgress) {
     const li = document.createElement('li');
     const name = document.createElement('span');
     name.className = 'uname';
-    name.textContent = `${file.name} (${formatBytes(file.size)})`;
+    name.textContent = `${folder ? `${folder}/` : ''}${file.name} (${formatBytes(file.size)})`;
     const bar = document.createElement('progress');
     bar.max = Math.max(file.size, 1);
     bar.value = 0;
@@ -312,9 +364,11 @@
         const secs = (performance.now() - startedAt) / 1000;
         const rate = secs > 0 ? loaded / secs : 0;
         status.textContent = `${Math.floor((loaded / Math.max(file.size, 1)) * 100)}% · ${formatBytes(rate)}/s`;
+        onProgress?.(loaded);
       },
       done(text) { li.className = 'ok'; bar.value = bar.max; status.textContent = text; },
       fail(text) { li.className = 'err'; status.textContent = text; },
+      remove() { li.remove(); },
       setText(text) { status.textContent = text; },
     };
   }
@@ -325,7 +379,8 @@
   function xhrRequest(method, url, body, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      state.currentXhr = xhr;
+      state.xhrs.add(xhr);
+      xhr.onloadend = () => state.xhrs.delete(xhr);
       xhr.open(method, url);
       xhr.responseType = 'text';
       if (typeof body === 'string') xhr.setRequestHeader('Content-Type', 'application/json');
@@ -357,15 +412,17 @@
    * as sequential chunks, so no single request exceeds proxy body limits (e.g.
    * Cloudflare's 100 MB), and a dropped connection only retries one chunk.
    */
-  async function uploadOne(setId, file, row) {
+  async function uploadOne(setId, file, row, folder = '') {
     const startedAt = performance.now();
     const chunkBytes = state.config?.chunkBytes || DEFAULT_CHUNK_BYTES;
     if (file.size <= chunkBytes) {
-      return xhrRequest('POST', `${setUrl(setId)}/files?name=${encodeURIComponent(file.name)}`, file,
+      const pathParam = folder ? `&path=${encodeURIComponent(folder)}` : '';
+      return xhrRequest('POST', `${setUrl(setId)}/files?name=${encodeURIComponent(file.name)}${pathParam}`, file,
         (loaded) => row.progress(loaded, startedAt));
     }
 
-    const session = await xhrRequest('POST', `${setUrl(setId)}/uploads`, JSON.stringify({ name: file.name, size: file.size }));
+    const session = await xhrRequest('POST', `${setUrl(setId)}/uploads`,
+      JSON.stringify({ name: file.name, size: file.size, ...(folder ? { path: folder } : {}) }));
     const base = `${setUrl(setId)}/uploads/${encodeURIComponent(session.uploadId)}`;
     let offset = 0;
     let failures = 0;
@@ -405,56 +462,232 @@
     }
   }
 
-  async function onUpload(ev) {
-    ev.preventDefault();
+  const isJunk = (name) => JUNK_NAMES.has(name.toLowerCase()) || name.startsWith('._');
+  const dirOf = (relPath) => relPath.slice(0, Math.max(0, relPath.lastIndexOf('/')));
+  const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
+
+  /** Check the whole batch against the set's limits before sending anything. Returns a message, or null. */
+  function precheck(items) {
+    const set = state.set;
+    const maxDepth = state.config?.maxPathDepth || 32;
+    const maxChars = state.config?.maxPathChars || 1024;
+    if (set.files.length + items.length > set.maxFiles) {
+      return `That is ${plural(items.length, 'file')}, and this file set already holds ${set.files.length.toLocaleString()} `
+        + `of at most ${set.maxFiles.toLocaleString()}. Nothing was uploaded.`;
+    }
+    const total = items.reduce((n, i) => n + i.file.size, 0);
+    const free = Math.max(0, set.maxBytes - set.usedBytes - set.reservedBytes);
+    if (total > free) {
+      return `Those files total ${formatBytes(total)}, but only ${formatBytes(free)} is left in this file set. Nothing was uploaded.`;
+    }
+    const deep = items.find((i) => i.path && (i.path.split('/').length > maxDepth || [...i.path].length > maxChars));
+    if (deep) {
+      return `The folder "${deep.path.slice(0, 80)}${deep.path.length > 80 ? '…' : ''}" is nested too deeply or its path is `
+        + `too long (at most ${maxDepth} levels and ${maxChars.toLocaleString()} characters). Nothing was uploaded.`;
+    }
+    return null;
+  }
+
+  function setUploadControls(busy) {
+    state.uploading = busy;
+    el.uploadBtn.disabled = busy;
+    el.files.disabled = busy;
+    el.chooseFolder.disabled = busy;
+    el.cancelUpload.hidden = !busy;
+  }
+
+  /**
+   * Upload a batch of { file, path } items. Small files go up to three at a
+   * time; files big enough to need chunking go one at a time alongside them.
+   * Finished files fold into the overall count, so 1000 files stay fast.
+   */
+  async function startUpload(rawItems) {
     clearMessage();
-    if (!state.set || state.uploading) return;
-    const files = [...el.files.files];
-    if (files.length === 0) return;
-
-    state.uploading = true;
+    if (!state.set) return;
+    if (state.uploading) {
+      showMessage('An upload is already running. Wait for it to finish, or cancel it first.');
+      return;
+    }
+    const items = rawItems.filter((i) => !isJunk(i.file.name));
+    const skipped = rawItems.length - items.length;
+    const skippedNote = skipped > 0 ? ` Skipped ${plural(skipped, 'system file')}.` : '';
+    if (items.length === 0) {
+      showMessage(`Nothing to upload. Empty folders are not kept.${skippedNote}`);
+      return;
+    }
+    // Claim the uploader before the await, so a second drop can't start a parallel batch.
+    setUploadControls(true);
     state.cancelRequested = false;
-    el.uploadBtn.disabled = true;
-    el.files.disabled = true;
-    el.cancelUpload.hidden = false;
-    el.uploadStatus.replaceChildren();
-    const rows = files.map(addStatusRow);
     const setId = state.set.id;
-    let failures = 0;
+    await refreshSet(); // check against current usage, not what this page last saw
+    const stillHere = state.set?.id === setId && !state.cancelRequested;
+    const problem = stillHere ? precheck(items) : '';
+    if (problem !== null) {
+      setUploadControls(false);
+      if (problem) showMessage(problem);
+      return;
+    }
 
-    for (let i = 0; i < files.length; i += 1) {
-      const file = files[i];
-      const row = rows[i];
-      if (state.cancelRequested || !state.set) { row.fail('Cancelled.'); continue; }
-      // Client-side pre-check for a friendly message; the server enforces the real limit.
-      const free = state.set.maxBytes - state.set.usedBytes - state.set.reservedBytes;
-      if (file.size > free) {
-        row.fail(`Does not fit: ${formatBytes(Math.max(0, free))} left in this file set.`);
-        failures += 1;
-        continue;
+    el.uploadStatus.replaceChildren();
+    const chunkBytes = state.config?.chunkBytes || DEFAULT_CHUNK_BYTES;
+    const small = items.filter((i) => i.file.size <= chunkBytes);
+    const large = items.filter((i) => i.file.size > chunkBytes);
+    const totalBytes = items.reduce((n, i) => n + i.file.size, 0);
+    const progress = { files: 0, bytes: 0, inflight: new Map(), queued: false };
+    let failures = 0;
+    let stopped = false;
+    let pendingSet = null;
+    let setTimer = null;
+
+    const renderOverall = () => {
+      progress.queued = false;
+      let bytes = progress.bytes;
+      for (const loaded of progress.inflight.values()) bytes += loaded;
+      el.overallBar.max = Math.max(totalBytes, 1);
+      el.overallBar.value = Math.min(bytes, totalBytes);
+      el.overallText.textContent = `${progress.files.toLocaleString()} of ${plural(items.length, 'file')}, `
+        + `${formatBytes(bytes)} of ${formatBytes(totalBytes)}${failures ? ` · ${failures.toLocaleString()} failed` : ''}`
+        + skippedNote;
+    };
+    const queueOverall = () => {
+      if (!progress.queued) { progress.queued = true; requestAnimationFrame(renderOverall); }
+    };
+    // Re-render the file list at most once a second while files keep landing.
+    const queueSetView = (set) => {
+      pendingSet = set;
+      if (!setTimer) {
+        setTimer = setTimeout(() => {
+          setTimer = null;
+          if (state.set?.id === setId && pendingSet) showSet(pendingSet);
+        }, 1000);
       }
-      row.setText('Uploading…');
-      try {
-        const result = await uploadOne(setId, file, row);
-        row.done('Uploaded.');
-        if (state.set && result?.set) showSet(result.set);
-      } catch (err) {
-        row.fail(err.message);
-        failures += 1;
-        if (err.code === 'SET_NOT_FOUND' || err.code === 'SET_EXPIRED') break;
-        if (err.code === 'ABORTED') state.cancelRequested = true;
+    };
+    el.overall.hidden = false;
+    renderOverall();
+
+    async function lane(queue) {
+      while (queue.length > 0 && !state.cancelRequested && !stopped && state.set?.id === setId) {
+        const item = queue.shift();
+        const key = {};
+        const row = addStatusRow(item.file, item.path, (loaded) => {
+          progress.inflight.set(key, loaded);
+          queueOverall();
+        });
+        row.setText('Uploading…');
+        try {
+          const result = await uploadOne(setId, item.file, row, item.path);
+          row.remove();
+          progress.files += 1;
+          progress.bytes += item.file.size;
+          if (result?.set) queueSetView(result.set);
+        } catch (err) {
+          row.fail(err.message);
+          failures += 1;
+          if (err.code === 'SET_NOT_FOUND' || err.code === 'SET_EXPIRED') stopped = true;
+          if (err.code === 'ABORTED') state.cancelRequested = true;
+        }
+        progress.inflight.delete(key);
+        queueOverall();
       }
     }
 
-    state.uploading = false;
-    state.currentXhr = null;
-    el.uploadBtn.disabled = false;
-    el.files.disabled = false;
-    el.cancelUpload.hidden = true;
+    const lanes = Array.from({ length: PARALLEL_SMALL_UPLOADS }, () => lane(small));
+    await Promise.all([...lanes, lane(large)]);
+
+    clearTimeout(setTimer);
+    setUploadControls(false);
     el.files.value = '';
-    if (failures > 0 && !state.cancelRequested) showMessage(`${failures} of ${files.length} upload(s) failed. See details below.`);
+    el.folder.value = '';
+    renderOverall();
+    const notStarted = small.length + large.length;
+    if (notStarted > 0) el.overallText.textContent += ` · ${notStarted.toLocaleString()} not started`;
+    if (failures > 0 && !state.cancelRequested) {
+      showMessage(`${failures.toLocaleString()} of ${plural(items.length, 'upload')} failed. See details below.`);
+    }
     await refreshSet();
   }
+
+  function onUpload(ev) {
+    ev.preventDefault();
+    const files = [...el.files.files];
+    if (files.length > 0) startUpload(files.map((file) => ({ file, path: '' })));
+  }
+
+  function onFolderPicked() {
+    // webkitRelativePath includes the picked folder's own name: "Trip/raw/a.jpg" -> path "Trip/raw".
+    const items = [...el.folder.files].map((file) => ({ file, path: dirOf(file.webkitRelativePath || '') }));
+    if (items.length > 0) startUpload(items);
+    else showMessage('That folder is empty. Empty folders are not kept.');
+  }
+
+  // ---------------------------------------------------------------- drag and drop
+
+  const readEntries = (reader) => new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+  const entryFile = (entry) => new Promise((resolve, reject) => entry.file(resolve, reject));
+
+  async function walkEntry(entry, folder, out) {
+    if (entry.isFile) {
+      out.push({ file: await entryFile(entry), path: folder });
+    } else if (entry.isDirectory) {
+      const sub = folder ? `${folder}/${entry.name}` : entry.name;
+      const reader = entry.createReader();
+      // readEntries hands back at most 100 entries per call (Chrome): keep reading until it's empty.
+      for (let batch = await readEntries(reader); batch.length > 0; batch = await readEntries(reader)) {
+        for (const child of batch) await walkEntry(child, sub, out);
+      }
+    }
+  }
+
+  const draggingFiles = (ev) => [...(ev.dataTransfer?.types || [])].includes('Files');
+  let dragDepth = 0;
+
+  function onDrop(ev) {
+    if (!draggingFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    el.uploadCard.classList.remove('dragover');
+    if (!state.set) return;
+    // The item list is cleared once this handler returns: take every entry before any await.
+    const dt = ev.dataTransfer;
+    const fallback = [...dt.files];
+    const entries = [];
+    if (dt.items && typeof DataTransferItem !== 'undefined' && 'webkitGetAsEntry' in DataTransferItem.prototype) {
+      for (const item of dt.items) {
+        if (item.kind !== 'file') continue;
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+    }
+    if (entries.length === 0) {
+      startUpload(fallback.map((file) => ({ file, path: '' })));
+      return;
+    }
+    (async () => {
+      const items = [];
+      for (const entry of entries) await walkEntry(entry, '', items);
+      return items;
+    })().then(startUpload, (err) => showMessage(`Could not read the dropped folders: ${err.message || err.name}`));
+  }
+
+  el.uploadCard.addEventListener('dragenter', (ev) => {
+    if (!draggingFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth += 1;
+    el.uploadCard.classList.add('dragover');
+  });
+  el.uploadCard.addEventListener('dragover', (ev) => {
+    if (!draggingFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = state.uploading ? 'none' : 'copy';
+  });
+  el.uploadCard.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) el.uploadCard.classList.remove('dragover');
+  });
+  el.uploadCard.addEventListener('drop', onDrop);
+  // A drop that misses the box must not navigate away from the page (and abort uploads).
+  window.addEventListener('dragover', (ev) => { if (draggingFiles(ev)) ev.preventDefault(); });
+  window.addEventListener('drop', (ev) => { if (draggingFiles(ev)) ev.preventDefault(); });
 
   // ---------------------------------------------------------------- wiring
 
@@ -468,9 +701,11 @@
   el.createForm.addEventListener('submit', onCreate);
   el.openForm.addEventListener('submit', onOpen);
   el.uploadForm.addEventListener('submit', onUpload);
+  el.chooseFolder.addEventListener('click', () => el.folder.click());
+  el.folder.addEventListener('change', onFolderPicked);
   el.cancelUpload.addEventListener('click', () => {
     state.cancelRequested = true;
-    state.currentXhr?.abort();
+    abortAll();
   });
   el.copyId.addEventListener('click', () => copyText(state.set?.id ?? '', 'ID'));
   el.copyLink.addEventListener('click', () => copyText(el.shareLink.textContent, 'Link'));

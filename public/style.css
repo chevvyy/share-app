@@ -66,6 +66,11 @@ a { color: var(--accent); }
 .upload-status .ustate { grid-column: 1 / -1; color: var(--muted); }
 .upload-status li.ok .ustate { color: var(--ok); }
 .upload-status li.err .ustate { color: var(--danger); }
+#upload-card.dragover { border: 2px dashed var(--accent); background: var(--warn-bg); }
+.overall { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin-top: .75rem; }
+.overall progress { flex: 1 1 14rem; }
+.header-actions { display: flex; gap: .75rem; align-items: center; }
+tr.folder td { font-weight: 600; background: var(--bg); }
 .message { margin: 1rem 0; padding: .7rem 1rem; border-radius: 8px; border: 1px solid; }
 .message.error { color: var(--danger); border-color: var(--danger); }
 .message.info { color: var(--ok); border-color: var(--ok); }

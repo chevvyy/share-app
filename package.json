@@ -1,6 +1,6 @@
 {
   "name": "share-app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Temporary file-sharing site: ID-addressed file sets that expire automatically.",
   "private": true,
   "license": "UNLICENSED",
