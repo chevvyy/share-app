@@ -19,4 +19,4 @@ resources:
 images:
   - name: share-app
     newName: ghcr.io/chevvyy/share-app
-    newTag: "1.0.0"
+    newTag: "1.1.0"
